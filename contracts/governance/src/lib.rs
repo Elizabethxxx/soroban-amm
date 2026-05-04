@@ -142,6 +142,7 @@ impl Governance {
     /// - `timelock_secs` must be > 0.
     /// - `quorum_bps` must be in [1, 10_000].
     /// - `min_proposer_stake_bps` must be in [0, 10_000].
+    #[allow(clippy::too_many_arguments)]
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -225,7 +226,11 @@ impl Governance {
             "insufficient stake to propose"
         );
 
-        let voting_period: u64 = env.storage().instance().get(&DataKey::VotingPeriod).unwrap();
+        let voting_period: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::VotingPeriod)
+            .unwrap();
         let timelock: u64 = env.storage().instance().get(&DataKey::Timelock).unwrap();
 
         let now = env.ledger().timestamp();
@@ -417,7 +422,11 @@ impl Governance {
     /// Return the current governance configuration parameters.
     pub fn get_params(env: Env) -> GovernanceParams {
         GovernanceParams {
-            voting_period_secs: env.storage().instance().get(&DataKey::VotingPeriod).unwrap(),
+            voting_period_secs: env
+                .storage()
+                .instance()
+                .get(&DataKey::VotingPeriod)
+                .unwrap(),
             timelock_secs: env.storage().instance().get(&DataKey::Timelock).unwrap(),
             quorum_bps: env.storage().instance().get(&DataKey::QuorumBps).unwrap(),
             min_proposer_stake_bps: env
@@ -572,8 +581,8 @@ mod tests {
             &lp_addr,
             &(7 * 24 * 60 * 60_u64), // voting_period_secs: 7 days
             &(2 * 24 * 60 * 60_u64), // timelock_secs: 2 days
-            &1_000_i128,              // quorum_bps: 10%
-            &100_i128,                // min_proposer_stake_bps
+            &1_000_i128,             // quorum_bps: 10%
+            &100_i128,               // min_proposer_stake_bps
         );
         token::LpTokenClient::new(&env, &lp_addr).set_locker(&gov_addr);
 

@@ -348,7 +348,8 @@ impl AmmPool {
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
-        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
         env.events()
             .publish((Symbol::new(&env, "upgraded"),), (new_wasm_hash,));
     }
@@ -457,9 +458,14 @@ impl AmmPool {
         let total_shares: i128 = Self::get_total_shares(env.clone());
 
         // Compute shares to mint.
+        let mut initial_mint = 0;
         let shares = if total_shares == 0 {
-            // Initial liquidity: geometric mean of deposits (scaled by 1e7).
-            Self::sqrt(amount_a * amount_b)
+            // Initial liquidity: geometric mean of deposits.
+            let initial_shares = Self::sqrt(amount_a * amount_b);
+            let min_liquidity = 1000;
+            assert!(initial_shares > min_liquidity, "initial liquidity too low");
+            initial_mint = min_liquidity;
+            initial_shares - min_liquidity
         } else {
             // Proportional shares — use the lesser of the two ratios.
             let shares_a = amount_a * total_shares / reserve_a;
@@ -489,12 +495,16 @@ impl AmmPool {
         env.storage()
             .instance()
             .set(&DataKey::ReserveB, &(reserve_b + amount_b));
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalShares, &(total_shares + shares));
+        env.storage().instance().set(
+            &DataKey::TotalShares,
+            &(total_shares + shares + initial_mint),
+        );
 
         // Mint LP tokens.
         let lp_client = LpTokenClient::new(&env, &lp_token);
+        if initial_mint > 0 {
+            lp_client.mint(&env.current_contract_address(), &initial_mint);
+        }
         lp_client.mint(&provider, &shares);
 
         env.events().publish(
@@ -741,19 +751,19 @@ impl AmmPool {
         };
 
         let final_reserve_a = if token_out == token_a {
-            // We received swap_output of token_a, and added amount_swap of token_b
-            new_reserve_a + swap_output
+            // We paid out swap_output of token_a
+            new_reserve_a - swap_output
         } else {
-            // We removed swap_output worth from token_a reserve, and added amount_swap of token_a
+            // We received amount_swap of token_a (minus protocol fee)
             new_reserve_a + amount_swap - protocol_fee
         };
 
         let final_reserve_b = if token_out == token_a {
-            // We added amount_swap of token_b (minus protocol fee)
+            // We received amount_swap of token_b (minus protocol fee)
             new_reserve_b + amount_swap - protocol_fee
         } else {
-            // We received swap_output of token_b
-            new_reserve_b + swap_output
+            // We paid out swap_output of token_b
+            new_reserve_b - swap_output
         };
 
         env.storage()
@@ -1176,7 +1186,18 @@ impl AmmPool {
             "flash loan was not repaid"
         );
 
-        let reserve_after = reserve + (balance_after - balance_before);
+        let accrued_fee = if token == token_a {
+            env.storage()
+                .instance()
+                .get(&DataKey::AccruedFeeA)
+                .unwrap_or(0)
+        } else {
+            env.storage()
+                .instance()
+                .get(&DataKey::AccruedFeeB)
+                .unwrap_or(0)
+        };
+        let reserve_after = balance_after - accrued_fee;
         if token == token_a {
             env.storage()
                 .instance()

@@ -128,7 +128,13 @@ mod tests {
         let provider = Address::generate(&env);
         ta_sac.mint(&provider, &2_000_000_i128);
         tb_sac.mint(&provider, &2_000_000_i128);
-        amm.add_liquidity(&provider, &2_000_000_i128, &2_000_000_i128, &0_i128, &10_000_u64);
+        amm.add_liquidity(
+            &provider,
+            &2_000_000_i128,
+            &2_000_000_i128,
+            &0_i128,
+            &10_000_u64,
+        );
 
         let consumer = TwapConsumerClient::new(&env, &consumer_addr);
         consumer.save_snapshot(&amm_addr);

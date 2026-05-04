@@ -9,9 +9,35 @@
 
 #![no_std]
 
-use amm::AmmPoolClient;
-use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Symbol, Vec};
-use token::LpTokenClient;
+use soroban_sdk::{
+    contract, contractclient, contractimpl, contracttype, Address, BytesN, Env, Symbol, Vec,
+};
+
+#[contractclient(name = "AmmPoolClient")]
+pub trait AmmPoolInterface {
+    #[allow(clippy::too_many_arguments)]
+    fn initialize(
+        env: Env,
+        admin: Address,
+        token_a: Address,
+        token_b: Address,
+        lp_token: Address,
+        fee_bps: i128,
+        fee_recipient: Address,
+        protocol_fee_bps: i128,
+    );
+}
+
+#[contractclient(name = "LpTokenClient")]
+pub trait LpTokenInterface {
+    fn initialize(
+        env: Env,
+        admin: Address,
+        name: soroban_sdk::String,
+        symbol: soroban_sdk::String,
+        decimals: u32,
+    );
+}
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
 
@@ -87,7 +113,7 @@ impl Factory {
         } else {
             (token_b, token_a)
         };
-        
+
         assert!(
             (0..=10_000).contains(&fee_bps),
             "invalid fee_bps: {fee_bps} must be in 0..=10_000"
@@ -161,7 +187,13 @@ impl Factory {
 
         env.events().publish(
             (Symbol::new(&env, "pool_created"),),
-            (ta.clone(), tb.clone(), pool_addr.clone(), fee_bps, lp_addr.clone()),
+            (
+                ta.clone(),
+                tb.clone(),
+                pool_addr.clone(),
+                fee_bps,
+                lp_addr.clone(),
+            ),
         );
 
         pool_addr
@@ -202,7 +234,8 @@ impl Factory {
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
-        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
         env.events()
             .publish((Symbol::new(&env, "upgraded"),), (new_wasm_hash,));
     }
@@ -282,7 +315,7 @@ impl Factory {
 //
 // Tests deploy the AMM and token contracts as real WASM. Build the WASM first:
 //
-//   cargo build --release --target wasm32v1-none
+//   cargo build --release --target wasm32-unknown-unknown
 //
 // Then run:
 //
@@ -295,11 +328,11 @@ mod tests {
 
     // Embed compiled WASM at test-compile time.
     mod amm_wasm {
-        soroban_sdk::contractimport!(file = "../../target/wasm32v1-none/release/amm.wasm");
+        soroban_sdk::contractimport!(file = "../../target/wasm32-unknown-unknown/release/amm.wasm");
     }
 
     mod token_wasm {
-        soroban_sdk::contractimport!(file = "../../target/wasm32v1-none/release/token.wasm");
+        soroban_sdk::contractimport!(file = "../../target/wasm32-unknown-unknown/release/token.wasm");
     }
 
     #[test]
