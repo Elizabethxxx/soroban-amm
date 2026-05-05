@@ -327,13 +327,7 @@ mod tests {
     use soroban_sdk::{testutils::Address as _, Env};
 
     // Embed compiled WASM at test-compile time.
-    mod amm_wasm {
-        soroban_sdk::contractimport!(file = "../../../target/wasm32v1-none/release/amm.wasm");
-    }
-
-    mod token_wasm {
-        soroban_sdk::contractimport!(file = "../../../target/wasm32v1-none/release/token.wasm");
-    }
+    // Use compiled WASM exported by the `amm` and `token` crates (feature `testutils`).
 
     #[test]
     fn test_create_pool() {
@@ -341,8 +335,8 @@ mod tests {
         env.budget().reset_unlimited();
         env.mock_all_auths();
 
-        let amm_hash = env.deployer().upload_contract_wasm(amm_wasm::WASM);
-        let token_hash = env.deployer().upload_contract_wasm(token_wasm::WASM);
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
 
         let admin = Address::generate(&env);
         let factory_addr = env.register_contract(None, Factory);
@@ -364,8 +358,8 @@ mod tests {
         env.budget().reset_unlimited();
         env.mock_all_auths();
 
-        let amm_hash = env.deployer().upload_contract_wasm(amm_wasm::WASM);
-        let token_hash = env.deployer().upload_contract_wasm(token_wasm::WASM);
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
 
         let admin = Address::generate(&env);
         let factory_addr = env.register_contract(None, Factory);
@@ -387,8 +381,8 @@ mod tests {
         env.budget().reset_unlimited();
         env.mock_all_auths();
 
-        let amm_hash = env.deployer().upload_contract_wasm(amm_wasm::WASM);
-        let token_hash = env.deployer().upload_contract_wasm(token_wasm::WASM);
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
 
         let admin = Address::generate(&env);
         let factory_addr = env.register_contract(None, Factory);
@@ -409,8 +403,8 @@ mod tests {
         env.budget().reset_unlimited();
         env.mock_all_auths();
 
-        let amm_hash = env.deployer().upload_contract_wasm(amm_wasm::WASM);
-        let token_hash = env.deployer().upload_contract_wasm(token_wasm::WASM);
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
 
         let admin = Address::generate(&env);
         let factory_addr = env.register_contract(None, Factory);
@@ -438,8 +432,8 @@ mod tests {
         env.budget().reset_unlimited();
         env.mock_all_auths();
 
-        let amm_hash = env.deployer().upload_contract_wasm(amm_wasm::WASM);
-        let token_hash = env.deployer().upload_contract_wasm(token_wasm::WASM);
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
 
         let admin = Address::generate(&env);
         let factory_addr = env.register_contract(None, Factory);
@@ -457,8 +451,9 @@ mod tests {
         let lp0 = factory.get_lp_token(&pool0).unwrap();
         let lp1 = factory.get_lp_token(&pool1).unwrap();
 
-        let lp_client0 = token_wasm::Client::new(&env, &lp0);
-        let lp_client1 = token_wasm::Client::new(&env, &lp1);
+        use soroban_sdk::token::Client as TokenClient;
+        let lp_client0 = TokenClient::new(&env, &lp0);
+        let lp_client1 = TokenClient::new(&env, &lp1);
 
         // Names and symbols must differ between the two pools.
         assert_ne!(lp_client0.name(), lp_client1.name());
@@ -471,8 +466,8 @@ mod tests {
         env.budget().reset_unlimited();
         env.mock_all_auths();
 
-        let amm_hash = env.deployer().upload_contract_wasm(amm_wasm::WASM);
-        let token_hash = env.deployer().upload_contract_wasm(token_wasm::WASM);
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
 
         let admin = Address::generate(&env);
         let factory_addr = env.register_contract(None, Factory);
@@ -494,7 +489,8 @@ mod tests {
         );
 
         let lp_addr = factory.get_lp_token(&pool).unwrap();
-        let lp = token_wasm::Client::new(&env, &lp_addr);
+        use soroban_sdk::token::Client as TokenClient;
+        let lp = TokenClient::new(&env, &lp_addr);
 
         assert_eq!(lp.name(), custom_name);
         assert_eq!(lp.symbol(), custom_symbol);
@@ -508,8 +504,8 @@ mod tests {
         env.budget().reset_unlimited();
         env.mock_all_auths();
 
-        let amm_hash = env.deployer().upload_contract_wasm(amm_wasm::WASM);
-        let token_hash = env.deployer().upload_contract_wasm(token_wasm::WASM);
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
 
         let admin = Address::generate(&env);
         let factory_addr = env.register_contract(None, Factory);
@@ -529,8 +525,8 @@ mod tests {
         env.budget().reset_unlimited();
         env.mock_all_auths();
 
-        let amm_hash = env.deployer().upload_contract_wasm(amm_wasm::WASM);
-        let token_hash = env.deployer().upload_contract_wasm(token_wasm::WASM);
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
 
         let admin = Address::generate(&env);
         let factory_addr = env.register_contract(None, Factory);
