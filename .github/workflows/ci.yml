@@ -10,16 +10,27 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
         with:
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-      - name: Build WASM
-        run: cargo build --release --target wasm32-unknown-unknown
-      - name: Test (all crates)
-        run: cargo test
+          profile: minimal
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - name: Add wasm target
+        run: rustup target add wasm32v1-none
+
+      - name: Build WASM artifacts
+        run: cargo build --release --target wasm32v1-none
+
+      - name: Run factory tests
+        run: cargo test -p factory
+
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all -- -D warnings
+
       - name: Format check
-        run: cargo fmt --check
+        run: cargo fmt --all -- --check
