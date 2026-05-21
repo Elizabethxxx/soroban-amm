@@ -26,8 +26,8 @@ jobs:
       - name: Build WASM artifacts
         run: cargo build --release --target wasm32v1-none
 
-      - name: Run factory tests
-        run: cargo test -p factory
+      - name: Run all tests
+        run: cargo test --workspace
 
       - name: Clippy
         run: cargo clippy --all -- -D warnings
