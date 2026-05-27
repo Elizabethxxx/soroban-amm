@@ -324,6 +324,11 @@ impl AmmPool {
         amount_in_with_fee * reserve_out / (reserve_in * 10_000 + amount_in_with_fee)
     }
 
+    /// Return the pool fee in basis points.
+    pub fn get_fee_info(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::FeeBps).unwrap()
+    }
+
     /// Return full pool state.
     pub fn get_info(env: Env) -> PoolInfo {
         PoolInfo {
@@ -473,6 +478,19 @@ mod tests {
 
         let info = amm.get_info();
         assert_eq!(info.total_shares, 0);
+    }
+
+    #[test]
+    fn test_get_fee_info() {
+        let (env, admin, amm_addr, lp_addr, _) = setup();
+        let (ta_client, _) = create_sac(&env, &admin);
+        let (tb_client, _) = create_sac(&env, &admin);
+
+        let amm = AmmPoolClient::new(&env, &amm_addr);
+        amm.initialize(&ta_client.address, &tb_client.address, &lp_addr, &30_i128);
+
+        assert_eq!(amm.get_fee_info(), 30_i128);
+        assert_eq!(amm.get_fee_info(), amm.get_info().fee_bps);
     }
 
     #[test]
