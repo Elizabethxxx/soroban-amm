@@ -10,16 +10,55 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
         with:
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-      - name: Build WASM
-        run: cargo build --release --target wasm32-unknown-unknown
-      - name: Test (all crates)
-        run: cargo test
+          profile: minimal
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - name: Add wasm target
+        run: rustup target add wasm32v1-none
+
+      - name: Build WASM artifacts
+        run: cargo build --release --target wasm32v1-none
+
+      - name: Check WASM binary sizes
+        run: |
+          for f in target/wasm32v1-none/release/*.wasm; do
+            size=$(wc -c < "$f")
+            echo "$f: ${size} bytes"
+            # 200 KB limit (204800 bytes). This budget is set conservatively above the current
+            # largest contract size (~74 KB) to monitor and control binary bloat, which
+            # directly impacts Soroban deployment costs (upload fees scale with WASM size).
+            if [ "$size" -gt 204800 ]; then
+              echo "FAIL: $f exceeds 200 KB limit"
+              exit 1
+            fi
+          done
+
+      - name: Run all tests
+        run: cargo test --workspace
+
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all -- -D warnings
+
       - name: Format check
-        run: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: Check docs
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
+
+      - name: Security audit
+        uses: rustsec/audit-check@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+        # Advisories can be ignored via audit.toml at the repo root.
+        # Example:
+        #   [[ignore]]
+        #   id = "RUSTSEC-0000-0000"
+        #   reason = "Not exploitable in this context because ..."
+
