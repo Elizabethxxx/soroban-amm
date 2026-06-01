@@ -25,6 +25,32 @@ pub enum FactoryError {
     ClPoolAlreadyExists = 4,
     ClWasmNotSet        = 5,
     Unauthorized        = 6,
+    InvalidFeeTier      = 7,
+}
+
+// ── Fee tier constants ───────────────────────────────────────────────────────
+
+/// Fee tier ID enumeration.
+/// Maps to standard AMM fee tiers: 0.01%, 0.05%, 0.3%, 1.0%
+#[contracttype]
+#[derive(Copy, Clone, Debug, PartialEq)]
+#[repr(i128)]
+pub enum FeeTier {
+    VeryLow  = 0,  // 0.01% = 1 bps
+    Low      = 1,  // 0.05% = 5 bps
+    Medium   = 2,  // 0.3% = 30 bps
+    High     = 3,  // 1.0% = 100 bps
+}
+
+/// Get the basis points value for a fee tier.
+pub fn fee_tier_to_bps(tier: i128) -> Result<i128, FactoryError> {
+    match tier {
+        0 => Ok(1),      // 0.01%
+        1 => Ok(5),      // 0.05%
+        2 => Ok(30),     // 0.3%
+        3 => Ok(100),    // 1.0%
+        _ => Err(FactoryError::InvalidFeeTier),
+    }
 }
 
 #[contractclient(name = "ClPoolClient")]
@@ -95,8 +121,7 @@ pub enum DataKey {
     ClWasmHash,                      // WASM hash for concentrated_liquidity deployments
     PoolCount,                       // u64 monotonic counter — used to derive unique deploy salts
     GovernanceFor(Address),          // pool address → Option<Address>
-    ClPool(Address, Address, i128),  // normalized (token_a, token_b, fee_bps) → CL pool Address
-}
+    ClPool(Address, Address, i128),  // normalized (token_a, token_b, fee_bps) → CL pool Address    DefaultFeeTier,                  // i128: default fee tier for new pools (0-3)}
 
 // ── Contract ──────────────────────────────────────────────────────────────────
 
@@ -131,22 +156,46 @@ impl Factory {
             .instance()
             .set(&DataKey::AllPools, &Vec::<Address>::new(&env));
         env.storage().instance().set(&DataKey::PoolCount, &0u64);
+        // Initialize default fee tier to Medium (0.3% = 30 bps)
+        env.storage().instance().set(&DataKey::DefaultFeeTier, &2i128);
         Ok(())
     }
 
     // ── Pool creation ─────────────────────────────────────────────────────────
 
-    /// Deploy a new AMM pool for `(token_a, token_b)` with `fee_bps` swap fee.
+    /// Deploy a new AMM pool for `(token_a, token_b)` with the specified fee tier.
     ///
     /// Token pair order is normalised — the pool is always stored with the
     /// lexicographically smaller address as `token_a`, so callers do not need
     /// to match the original order when looking up a pool.
     ///
-    /// `lp_name` and `lp_symbol` set the LP token's metadata. When `None` the
-    /// factory generates counter-based defaults: `"AMM LP Token #N"` / `"ALPN"`.
+    /// `fee_tier` must be 0-3:
+    ///   - 0: 0.01% (1 bps)
+    ///   - 1: 0.05% (5 bps)
+    ///   - 2: 0.3% (30 bps, default)
+    ///   - 3: 1.0% (100 bps)
+    ///
+    /// For custom fee tiers, use `create_pool_with_fee_bps` instead.
     ///
     /// Panics if a pool for this pair already exists.
     pub fn create_pool(
+        env: Env,
+        token_a: Address,
+        token_b: Address,
+        fee_tier: i128,
+        governance_wasm_hash: Option<BytesN<32>>,
+    ) -> Result<(Address, Option<Address>), FactoryError> {
+        let fee_bps = fee_tier_to_bps(fee_tier)?;
+        Self::create_pool_with_fee_bps(env, token_a, token_b, fee_bps, governance_wasm_hash)
+    }
+
+    /// Deploy a new AMM pool for `(token_a, token_b)` with a custom fee in basis points.
+    ///
+    /// This allows pools to be created with custom fees outside the standard tiers.
+    /// For most use cases, prefer `create_pool` with a standard fee tier.
+    ///
+    /// Token pair order is normalised. Panics if a pool for this pair already exists.
+    pub fn create_pool_with_fee_bps(
         env: Env,
         token_a: Address,
         token_b: Address,
@@ -308,6 +357,26 @@ impl Factory {
         Ok(())
     }
 
+    /// Set the default fee tier for new pool deployments. Admin-only.
+    ///
+    /// `fee_tier` must be 0-3 (VeryLow, Low, Medium, High).
+    /// Existing pools are unaffected; only pools created after this call
+    /// will use the new default tier.
+    pub fn set_default_fee_tier(env: Env, fee_tier: i128) -> Result<(), FactoryError> {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        
+        // Validate the fee tier
+        fee_tier_to_bps(fee_tier)?;
+        
+        env.storage().instance().set(&DataKey::DefaultFeeTier, &fee_tier);
+        env.events().publish(
+            (Symbol::new(&env, "default_fee_tier_updated"),),
+            (fee_tier,),
+        );
+        Ok(())
+    }
+
     /// Replace the factory contract WASM with a new version. Admin-only.
     ///
     /// The new WASM must already be uploaded to the network.
@@ -414,6 +483,28 @@ impl Factory {
             .instance()
             .get(&DataKey::GovernanceFor(pool))
             .unwrap_or(None)
+    }
+
+    /// Return the current default fee tier.
+    ///
+    /// Returns the fee tier ID (0-3) that will be used for new pools
+    /// if no specific tier is provided to `create_pool`.
+    pub fn get_default_fee_tier(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::DefaultFeeTier)
+            .unwrap_or(2) // Default to Medium (0.3%) if not set
+    }
+
+    /// Convert a fee tier ID to its basis points value.
+    ///
+    /// # Returns
+    /// - 0 → 1 bps (0.01%)
+    /// - 1 → 5 bps (0.05%)
+    /// - 2 → 30 bps (0.3%)
+    /// - 3 → 100 bps (1.0%)
+    pub fn get_fee_tier_bps(env: Env, fee_tier: i128) -> Result<i128, FactoryError> {
+        fee_tier_to_bps(fee_tier)
     }
 
     /// Return the pool address for `(token_a, token_b)`, or `None` if it does
@@ -554,7 +645,8 @@ mod tests {
         let ta = Address::generate(&env);
         let tb = Address::generate(&env);
 
-        let (pool, gov) = factory.create_pool(&ta, &tb, &30_i128, &None);
+        // Create pool with Medium fee tier (0.3%)
+        let (pool, gov) = factory.create_pool(&ta, &tb, &2i128, &None);
 
         assert_eq!(factory.get_pool(&ta, &tb), Some(pool.clone()));
         assert_eq!(factory.all_pools().len(), 1);
@@ -580,7 +672,8 @@ mod tests {
         let ta = Address::generate(&env);
         let tb = Address::generate(&env);
 
-        let (pool, gov) = factory.create_pool(&ta, &tb, &30_i128, &Some(gov_hash));
+        // Create pool with High fee tier (1.0%)
+        let (pool, gov) = factory.create_pool(&ta, &tb, &3i128, &Some(gov_hash));
 
         assert_eq!(factory.get_pool(&ta, &tb), Some(pool.clone()));
         assert_eq!(factory.all_pools().len(), 1);
@@ -605,7 +698,7 @@ mod tests {
         let ta = Address::generate(&env);
         let tb = Address::generate(&env);
 
-        factory.create_pool(&ta, &tb, &30_i128, &None);
+        factory.create_pool(&ta, &tb, &2i128, &None);
 
         // Reverse-order lookup returns the same pool.
         assert_eq!(factory.get_pool(&ta, &tb), factory.get_pool(&tb, &ta));
@@ -628,8 +721,8 @@ mod tests {
         let ta = Address::generate(&env);
         let tb = Address::generate(&env);
 
-        factory.create_pool(&ta, &tb, &30_i128, &None);
-        let result = factory.try_create_pool(&ta, &tb, &30_i128, &None);
+        factory.create_pool(&ta, &tb, &2i128, &None);
+        let result = factory.try_create_pool(&ta, &tb, &2i128, &None);
         assert!(result.is_err());
     }
 
@@ -653,10 +746,10 @@ mod tests {
         let tb = Address::generate(&env);
         let tc = Address::generate(&env);
 
-        factory.create_pool(&ta, &tb, &30_i128, &None);
+        factory.create_pool(&ta, &tb, &2i128, &None);
         assert_eq!(factory.all_pools().len(), 1);
 
-        factory.create_pool(&ta, &tc, &30_i128, &None);
+        factory.create_pool(&ta, &tc, &2i128, &None);
         assert_eq!(factory.all_pools().len(), 2);
     }
 
@@ -680,8 +773,8 @@ mod tests {
         let tb = Address::generate(&env);
         let tc = Address::generate(&env);
 
-        let (pool0, _) = factory.create_pool(&ta, &tb, &30_i128, &None);
-        let (pool1, _) = factory.create_pool(&ta, &tc, &30_i128, &None);
+        let (pool0, _) = factory.create_pool(&ta, &tb, &2i128, &None);
+        let (pool1, _) = factory.create_pool(&ta, &tc, &2i128, &None);
 
         // Fetch LP token addresses via the factory's registry.
         let lp0 = factory.get_lp_token(&pool0).unwrap();
@@ -740,7 +833,7 @@ mod tests {
         // Pool creation still works after an update.
         let ta = Address::generate(&env);
         let tb = Address::generate(&env);
-        let (pool, _) = factory.create_pool(&ta, &tb, &30_i128, &None);
+        let (pool, _) = factory.create_pool(&ta, &tb, &2i128, &None);
         assert!(factory.get_pool(&ta, &tb).is_some());
         assert!(factory.get_lp_token(&pool).is_some());
 
@@ -836,13 +929,13 @@ mod tests {
         let tc = Address::generate(&env);
         let td = Address::generate(&env);
 
-        let (pool1, _) = factory.create_pool(&ta, &tb, &30_i128, &None);
+        let (pool1, _) = factory.create_pool(&ta, &tb, &2i128, &None);
         assert_eq!(factory.get_pool_count(), 1);
 
-        let (pool2, _) = factory.create_pool(&ta, &tc, &30_i128, &None);
+        let (pool2, _) = factory.create_pool(&ta, &tc, &2i128, &None);
         assert_eq!(factory.get_pool_count(), 2);
 
-        let (pool3, _) = factory.create_pool(&ta, &td, &30_i128, &None);
+        let (pool3, _) = factory.create_pool(&ta, &td, &2i128, &None);
         assert_eq!(factory.get_pool_count(), 3);
 
         // Page 1: first two pools.
@@ -893,7 +986,7 @@ mod tests {
         let ta = Address::generate(&env);
         let tb = Address::generate(&env);
 
-        let (pool_addr, _) = factory.create_pool(&ta, &tb, &30_i128, &None);
+        let (pool_addr, _) = factory.create_pool(&ta, &tb, &2i128, &None);
 
         // Locate the pool_created event.
         let events = env.events().all();
@@ -934,14 +1027,14 @@ mod tests {
         let ta = Address::generate(&env);
         let tb = Address::generate(&env);
 
-        factory.create_pool(&ta, &tb, &30_i128, &None);
+        factory.create_pool(&ta, &tb, &2i128, &None);
 
         // Clear events so we only see events from the second (failing) call.
         // Soroban test env accumulates events — count before the duplicate attempt.
         let count_before = env.events().all().len();
 
         // Duplicate call must fail.
-        let result = factory.try_create_pool(&ta, &tb, &30_i128, &None);
+        let result = factory.try_create_pool(&ta, &tb, &2i128, &None);
         assert!(result.is_err(), "duplicate pool creation must fail");
 
         // No new events must have been added.
@@ -951,4 +1044,145 @@ mod tests {
             "no event should be emitted when create_pool reverts"
         );
     }
+
+    // ── Issue #229: Dynamic fee tiers ──────────────────────────────────────────
+
+    #[test]
+    fn test_fee_tier_to_bps_conversion() {
+        // Test all fee tier conversions
+        assert_eq!(fee_tier_to_bps(0).unwrap(), 1);      // VeryLow: 0.01%
+        assert_eq!(fee_tier_to_bps(1).unwrap(), 5);      // Low: 0.05%
+        assert_eq!(fee_tier_to_bps(2).unwrap(), 30);     // Medium: 0.3%
+        assert_eq!(fee_tier_to_bps(3).unwrap(), 100);    // High: 1.0%
+        
+        // Invalid fee tiers should error
+        assert!(fee_tier_to_bps(4).is_err());
+        assert!(fee_tier_to_bps(-1).is_err());
+    }
+
+    #[test]
+    fn test_create_pool_with_all_fee_tiers() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+
+        let admin = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+
+        let ta = Address::generate(&env);
+        let tb = Address::generate(&env);
+        let tc = Address::generate(&env);
+        let td = Address::generate(&env);
+
+        // Create pools with all fee tiers
+        let (pool0, _) = factory.create_pool(&ta, &tb, &0i128, &None);  // VeryLow: 0.01% = 1 bps
+        let (pool1, _) = factory.create_pool(&ta, &tc, &1i128, &None);  // Low: 0.05% = 5 bps
+        let (pool2, _) = factory.create_pool(&ta, &td, &2i128, &None);  // Medium: 0.3% = 30 bps
+        
+        // Generate new token for High tier pool
+        let te = Address::generate(&env);
+        let (pool3, _) = factory.create_pool(&tb, &te, &3i128, &None);  // High: 1.0% = 100 bps
+
+        // Verify all pools were created
+        assert!(factory.get_pool(&ta, &tb).is_some());
+        assert!(factory.get_pool(&ta, &tc).is_some());
+        assert!(factory.get_pool(&ta, &td).is_some());
+        assert!(factory.get_pool(&tb, &te).is_some());
+        
+        assert_eq!(factory.all_pools().len(), 4);
+    }
+
+    #[test]
+    fn test_get_fee_tier_bps() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+
+        let admin = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+
+        // Test fee tier to bps conversion via factory
+        assert_eq!(factory.get_fee_tier_bps(&0i128).unwrap(), 1);
+        assert_eq!(factory.get_fee_tier_bps(&1i128).unwrap(), 5);
+        assert_eq!(factory.get_fee_tier_bps(&2i128).unwrap(), 30);
+        assert_eq!(factory.get_fee_tier_bps(&3i128).unwrap(), 100);
+    }
+
+    #[test]
+    fn test_default_fee_tier() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+
+        let admin = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+
+        // Default fee tier should be 2 (Medium: 0.3%)
+        assert_eq!(factory.get_default_fee_tier(), 2i128);
+    }
+
+    #[test]
+    fn test_set_default_fee_tier() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+
+        let admin = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+
+        // Change default fee tier to High (1.0%)
+        factory.set_default_fee_tier(&3i128).unwrap();
+        assert_eq!(factory.get_default_fee_tier(), 3i128);
+
+        // Change to Low (0.05%)
+        factory.set_default_fee_tier(&1i128).unwrap();
+        assert_eq!(factory.get_default_fee_tier(), 1i128);
+
+        // Invalid tier should error
+        assert!(factory.try_set_default_fee_tier(&99i128).is_err());
+    }
+
+    #[test]
+    fn test_create_pool_with_fee_bps_directly() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+
+        let admin = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+
+        let ta = Address::generate(&env);
+        let tb = Address::generate(&env);
+
+        // Create pool with custom fee bps (15 bps = 0.15%)
+        let (pool, _) = factory.create_pool_with_fee_bps(&ta, &tb, &15i128, &None);
+        assert!(factory.get_pool(&ta, &tb).is_some());
+        assert_eq!(factory.get_lp_token(&pool).is_some(), true);
+    }
 }
+
