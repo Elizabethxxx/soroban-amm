@@ -26,6 +26,20 @@ use soroban_sdk::token::Client as SepTokenClient;
 ///
 /// We define this locally rather than importing the `token` crate to avoid
 /// duplicate symbol errors during the WASM build.
+/// Oracle aggregator price quote (#318).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct AggregatedPrice {
+    pub price: i128,
+    pub confidence: u32,
+}
+
+#[contractclient(name = "OracleAggregatorClient")]
+pub trait OracleAggregatorInterface {
+    /// Returns median price + confidence; confidence 0 when sources are stale.
+    fn get_price_safe(env: Env, token_a: Address, token_b: Address) -> AggregatedPrice;
+}
+
 #[soroban_sdk::contractclient(name = "LpTokenClient")]
 pub trait LpTokenInterface {
     fn initialize(
@@ -72,6 +86,8 @@ pub enum AmmError {
     /// `min_received` threshold permitted. The pool received fewer tokens
     /// than requested; the call is reverted to protect the caller.
     FotSlippage          = 16,
+    /// Spot price deviated beyond the configured oracle tolerance.
+    OracleDeviationExceeded = 17,
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -129,6 +145,11 @@ pub enum DataKey {
 
     /// Ledger sequence number at which `CircuitBreakerLastPrice` was captured.
     CircuitBreakerLastSeqno,
+
+    /// Optional oracle aggregator for pre-swap deviation checks (#318).
+    OracleAggregator,
+    /// Max allowed spot-vs-oracle deviation in basis points (e.g. 500 = 5 %).
+    MaxOracleDeviationBps,
 }
 
 // ── Pool info returned by `get_info` ─────────────────────────────────────────
@@ -319,6 +340,46 @@ impl AmmPool {
         env.storage()
             .instance()
             .set(&DataKey::CircuitBreakerLastSeqno, &0_u32);
+        // Oracle deviation guard (#318): disabled until admin configures an oracle.
+        env.storage()
+            .instance()
+            .set(&DataKey::OracleAggregator, &Option::<Address>::None);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxOracleDeviationBps, &500_i128);
+        Ok(())
+    }
+
+    /// Admin: attach or remove the oracle aggregator used for swap deviation checks.
+    pub fn set_oracle(env: Env, admin: Address, oracle: Option<Address>) -> Result<(), AmmError> {
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            return Err(AmmError::Unauthorized);
+        }
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::OracleAggregator, &oracle);
+        Ok(())
+    }
+
+    /// Admin: max spot-vs-oracle deviation in basis points before swaps revert.
+    pub fn set_max_oracle_deviation_bps(
+        env: Env,
+        admin: Address,
+        max_deviation_bps: i128,
+    ) -> Result<(), AmmError> {
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            return Err(AmmError::Unauthorized);
+        }
+        admin.require_auth();
+        if !(0..=10_000).contains(&max_deviation_bps) {
+            return Err(AmmError::InvalidFeeBps);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxOracleDeviationBps, &max_deviation_bps);
         Ok(())
     }
 
@@ -574,6 +635,45 @@ impl AmmPool {
 
         Ok(())
     }
+
+    /// Revert when spot price deviates too far from the configured oracle (#318).
+    fn check_oracle_deviation(
+        env: &Env,
+        token_in: &Address,
+        token_out: &Address,
+        amount_in: i128,
+        amount_out: i128,
+    ) -> Result<(), AmmError> {
+        let oracle: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::OracleAggregator);
+        let Some(oracle_addr) = oracle else {
+            return Ok(());
+        };
+        let max_dev: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxOracleDeviationBps)
+            .unwrap_or(500);
+
+        let agg = OracleAggregatorClient::new(env, &oracle_addr)
+            .get_price_safe(token_in, token_out);
+        if agg.confidence == 0 || agg.price <= 0 {
+            return Ok(());
+        }
+
+        const PRICE_SCALE: i128 = 1_000_000;
+        let spot_price = amount_out * PRICE_SCALE / amount_in;
+        let oracle_price = agg.price;
+        let deviation_bps = if spot_price >= oracle_price {
+            (spot_price - oracle_price) * 10_000 / oracle_price
+        } else {
+            (oracle_price - spot_price) * 10_000 / oracle_price
+        };
+        if deviation_bps > max_dev {
+            return Err(AmmError::OracleDeviationExceeded);
+        }
         Ok(())
     }
 
@@ -768,16 +868,16 @@ impl AmmPool {
     /// This ensures that any reserve-mutating operation (add_liquidity, remove_liquidity,
     /// swap, flash_loan) correctly records the price at the time of the operation,
     /// preventing TWAP manipulation vectors.
-    fn checkpoint_twap(env: &Env) {
+    fn checkpoint_twap(env: &Env) -> (i128, i128) {
         let now = env.ledger().timestamp();
         let last: u64 = env
             .storage()
             .instance()
             .get(&DataKey::LastTimestamp)
             .unwrap_or(now);
+        let reserve_a = Self::get_reserve_a(env.clone());
+        let reserve_b = Self::get_reserve_b(env.clone());
         if now > last {
-            let reserve_a = Self::get_reserve_a(env.clone());
-            let reserve_b = Self::get_reserve_b(env.clone());
             if reserve_a > 0 && reserve_b > 0 {
                 let elapsed = (now - last) as i128;
                 let mut cum_a: i128 = env
@@ -803,6 +903,7 @@ impl AmmPool {
             }
             env.storage().instance().set(&DataKey::LastTimestamp, &now);
         }
+        (reserve_a, reserve_b)
     }
 
     /// Update the TWAL liquidity accumulator (sqrt(reserve_a * reserve_b) * elapsed).
@@ -868,8 +969,6 @@ impl AmmPool {
         provider: Address,
         amount_a: i128,
         amount_b: i128,
-        min_amount_a: i128,
-        min_amount_b: i128,
         min_shares: i128,
         deadline: u64,
     ) -> Result<i128, AmmError> {
@@ -888,17 +987,17 @@ impl AmmPool {
             return Err(AmmError::ZeroAmount);
         }
 
+       // Checkpoint TWAP before updating reserves; reuse the reserves it read.
+        let (reserve_a, reserve_b) = Self::checkpoint_twap(&env);
         // Checkpoint oracles before updating reserves.
         Self::checkpoint_oracles(&env);
 
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
         let lp_token: Address = env.storage().instance().get(&DataKey::LpToken).unwrap();
-
-        let reserve_a: i128 = Self::get_reserve_a(env.clone());
-        let reserve_b: i128 = Self::get_reserve_b(env.clone());
         let total_shares: i128 = Self::get_total_shares(env.clone());
 
+        // Compute shares to mint.
         // Compute shares to mint.
         let shares = if total_shares == 0 {
             // Initial liquidity: geometric mean of deposits.
@@ -992,6 +1091,8 @@ impl AmmPool {
             return Err(AmmError::ZeroAmount);
         }
 
+        // Checkpoint TWAP before updating reserves.
+        let (reserve_a, reserve_b) = Self::checkpoint_twap(&env);
         // Checkpoint oracles before updating reserves.
         Self::checkpoint_oracles(&env);
 
@@ -1004,8 +1105,7 @@ impl AmmPool {
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
         let lp_token: Address = env.storage().instance().get(&DataKey::LpToken).unwrap();
 
-        let reserve_a = Self::get_reserve_a(env.clone());
-        let reserve_b = Self::get_reserve_b(env.clone());
+        
         let total_shares = Self::get_total_shares(env.clone());
 
         let out_a = shares * reserve_a / total_shares;
@@ -1091,6 +1191,8 @@ impl AmmPool {
             return Err(AmmError::ZeroAmount);
         }
 
+        // Checkpoint TWAP before updating reserves.
+        let (reserve_a, reserve_b) = Self::checkpoint_twap(&env);
         // Checkpoint oracles before updating reserves.
         Self::checkpoint_oracles(&env);
 
@@ -1107,8 +1209,6 @@ impl AmmPool {
             return Err(AmmError::InvalidToken);
         }
 
-        let reserve_a = Self::get_reserve_a(env.clone());
-        let reserve_b = Self::get_reserve_b(env.clone());
         let total_shares = Self::get_total_shares(env.clone());
 
         // Compute proportional withdrawal amounts.
@@ -1284,7 +1384,6 @@ impl AmmPool {
         amount_in: i128,
         min_out: i128,
         deadline: u64,
-        referrer: Option<Address>,
     ) -> Result<i128, AmmError> {
         if deadline < env.ledger().timestamp() {
             return Err(AmmError::DeadlineExceeded);
@@ -1301,6 +1400,8 @@ impl AmmPool {
             return Err(AmmError::ZeroAmount);
         }
 
+// Checkpoint TWAP before updating reserves; reuse the reserves it read.
+        let (reserve_a, reserve_b) = Self::checkpoint_twap(&env);
         // Checkpoint oracles before updating reserves.
         Self::checkpoint_oracles(&env);
 
@@ -1310,19 +1411,10 @@ impl AmmPool {
 
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
-
         let (reserve_in, reserve_out, token_out) = if token_in == token_a {
-            (
-                Self::get_reserve_a(env.clone()),
-                Self::get_reserve_b(env.clone()),
-                token_b.clone(),
-            )
+            (reserve_a, reserve_b, token_b.clone())
         } else if token_in == token_b {
-            (
-                Self::get_reserve_b(env.clone()),
-                Self::get_reserve_a(env.clone()),
-                token_a.clone(),
-            )
+            (reserve_b, reserve_a, token_a.clone())
         } else {
             return Err(AmmError::InvalidToken);
         };
@@ -1345,6 +1437,8 @@ impl AmmPool {
         if amount_out >= reserve_out {
             return Err(AmmError::InsufficientLiquidity);
         }
+
+        Self::check_oracle_deviation(&env, &token_in, &token_out, amount_in, amount_out)?;
 
         // Transfer in.
         let client_in = SepTokenClient::new(&env, &token_in);
@@ -1402,7 +1496,11 @@ impl AmmPool {
             }
         }
 
-        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "swap"), trader), (token_in, amount_in, token_out, amount_out, referrer));
+        env.events().publish(
+            (Symbol::new(&env, "swap"), trader.clone()),
+            (token_in.clone(), amount_in, token_out.clone(), amount_out),
+        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "swap"), trader), (token_in, amount_in, token_out, amount_out, None::<Address>));
 
         Ok(amount_out)
     }
@@ -1435,7 +1533,7 @@ impl AmmPool {
         amount_out: i128,
         max_in: i128,
         deadline: u64,
-        referrer: Option<Address>,
+        
     ) -> Result<i128, AmmError> {
         if deadline < env.ledger().timestamp() {
             return Err(AmmError::DeadlineExceeded);
@@ -1452,6 +1550,8 @@ impl AmmPool {
             return Err(AmmError::ZeroAmount);
         }
 
+        // Checkpoint TWAP before updating reserves.
+        let (reserve_a, reserve_b) = Self::checkpoint_twap(&env);
         // Checkpoint oracles before updating reserves.
         Self::checkpoint_oracles(&env);
 
@@ -1473,6 +1573,8 @@ impl AmmPool {
         if amount_in > max_in {
             return Err(AmmError::SlippageExceeded);
         }
+
+        Self::check_oracle_deviation(&env, &token_in, &token_out, amount_in, amount_out)?;
 
         // Transfer tokens.
         SepTokenClient::new(&env, &token_in).transfer(
@@ -1499,8 +1601,7 @@ impl AmmPool {
         };
 
         // Update reserves.
-        let reserve_a = Self::get_reserve_a(env.clone());
-        let reserve_b = Self::get_reserve_b(env.clone());
+        
         if token_in == token_a {
             env.storage()
                 .instance()
@@ -1537,7 +1638,11 @@ impl AmmPool {
             }
         }
 
-        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "swap"), trader), (token_in, amount_in, token_out, amount_out, referrer));
+        env.events().publish(
+            (Symbol::new(&env, "swap"), trader.clone()),
+            (token_in.clone(), amount_in, token_out.clone(), amount_out),
+        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "swap"), trader), (token_in, amount_in, token_out, amount_out, None::<Address>));
 
         Ok(amount_in)
     }
@@ -1614,6 +1719,8 @@ impl AmmPool {
             return Err(AmmError::ZeroAmount);
         }
 
+        // Checkpoint TWAP before updating reserves.
+        let (reserve_a, reserve_b) = Self::checkpoint_twap(&env);
         // Acquire the reentrancy lock before any external call.
         // This prevents the receiver's on_flash_loan callback from calling
         // back into swap / add_liquidity / remove_liquidity / flash_loan.
@@ -1628,9 +1735,9 @@ impl AmmPool {
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
         let reserve = if token == token_a {
-            Self::get_reserve_a(env.clone())
+           reserve_a
         } else if token == token_b {
-            Self::get_reserve_b(env.clone())
+            reserve_b
         } else {
             // exit_lock is not needed: returning Err reverts all storage writes.
             return Err(AmmError::InvalidToken);
@@ -1794,7 +1901,11 @@ impl AmmPool {
         let fee_amount = amount_in * fee_bps / 10_000;
         let spot_price = reserve_out * 1_000_000 / reserve_in;
         let effective_price = amount_out * 1_000_000 / amount_in;
-        let price_impact_bps = ((spot_price - effective_price) * 10_000 / spot_price).max(0);
+        let price_impact_bps = if amount_out == 0 {
+            0
+        } else {
+            ((spot_price - effective_price) * 10_000 / spot_price).max(0)
+        };
         Ok(SwapSimulation {
             amount_out,
             fee_amount,
@@ -1842,6 +1953,11 @@ impl AmmPool {
     /// - `admin` — the pool administrator.
     /// - `fee_recipient` — recipient of accrued protocol fees.
     /// - `protocol_fee_bps` — protocol fee in basis points (subset of `fee_bps`).
+    
+    pub fn get_fee_info(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::FeeBps).unwrap()
+    }
+
     pub fn get_info(env: Env) -> PoolInfo {
         PoolInfo {
             token_a: env.storage().instance().get(&DataKey::TokenA).unwrap(),
@@ -1997,6 +2113,8 @@ impl AmmPool {
         if amount_out >= reserve_out {
             return Err(AmmError::InsufficientLiquidity);
         }
+
+        Self::check_oracle_deviation(&env, &token_in, &token_out, actual_received, amount_out)?;
 
         SepTokenClient::new(&env, &token_out).transfer(&pool, &trader, &amount_out);
 
@@ -3682,6 +3800,53 @@ pub(crate) mod tests {
         );
         assert!(result.is_err());
     }
+    #[test]
+    fn bench_swap_cost() {
+        extern crate std;
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+        let provider = Address::generate(env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
+
+        let trader = Address::generate(env);
+        ta_sac.mint(&trader, &100_000_i128);
+
+        env.budget().reset_default();
+        amm.swap(&trader, &ts.ta_addr, &100_000_i128, &0_i128, &u64::MAX);
+        std::println!("=== SWAP BUDGET ===");
+        std::println!("{}", env.budget());
+    }
+
+    #[test]
+    fn bench_add_liquidity_cost() {
+        extern crate std;
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+        // seed once so we hit the "else" (proportional) branch on the measured call
+        let seeder = Address::generate(env);
+        ta_sac.mint(&seeder, &1_000_000_i128);
+        tb_sac.mint(&seeder, &1_000_000_i128);
+        amm.add_liquidity(&seeder, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
+
+        let provider = Address::generate(env);
+        ta_sac.mint(&provider, &500_000_i128);
+        tb_sac.mint(&provider, &500_000_i128);
+
+        env.budget().reset_default();
+        amm.add_liquidity(&provider, &500_000_i128, &500_000_i128, &0_i128, &u64::MAX);
+        std::println!("=== ADD_LIQ BUDGET ===");
+        std::println!("{}", env.budget());
+    }
 }
 
 // ── Property-based tests ───────────────────────────────────────────────────────
@@ -3859,7 +4024,15 @@ mod prop_tests {
         let (tb_client, _) = create_sac(&env, &admin);
 
         let amm = AmmPoolClient::new(&env, &amm_addr);
-        amm.initialize(&ta_client.address, &tb_client.address, &lp_addr, &30_i128);
+        amm.initialize(
+            &admin,
+            &ta_client.address,
+            &tb_client.address,
+            &lp_addr,
+            &30_i128,
+            &admin,
+            &0_i128,
+        );
 
         assert_eq!(amm.get_fee_info(), 30_i128);
         assert_eq!(amm.get_fee_info(), amm.get_info().fee_bps);
@@ -4463,16 +4636,16 @@ mod prop_tests {
             &1_000_000_i128,
             &0_i128,
             &u64::MAX,
-        )
-        .unwrap();
+        );
+       
 
         // --- Tiny swap: price_impact_bps should be 0 (rounds to 0 at 1 unit). ---
-        let tiny = amm.simulate_swap(&ts.ta_addr, &1_i128).unwrap();
+        let tiny = amm.simulate_swap(&ts.ta_addr, &1_i128);
         // spot and effective price differ by sub-bps amounts for 1-unit swap.
         assert_eq!(tiny.price_impact_bps, 0);
 
         // --- Large swap: price_impact_bps must be positive. ---
-        let large = amm.simulate_swap(&ts.ta_addr, &100_000_i128).unwrap();
+        let large = amm.simulate_swap(&ts.ta_addr, &100_000_i128);
         // With reserves 1_000_000 / 1_000_000 and amount_in 100_000 (10 % of pool):
         //   spot_price  = 1_000_000 * 1_000_000 / 1_000_000 = 1_000_000
         //   amount_in_with_fee = 100_000 * (10000 - 30) = 997_000_000
@@ -4481,7 +4654,7 @@ mod prop_tests {
         assert!(large.price_impact_bps > 0, "price_impact_bps must be positive for large swap");
 
         // Larger swap must have higher price impact than smaller swap.
-        let medium = amm.simulate_swap(&ts.ta_addr, &10_000_i128).unwrap();
+        let medium = amm.simulate_swap(&ts.ta_addr, &10_000_i128);
         assert!(
             large.price_impact_bps > medium.price_impact_bps,
             "larger swap must have larger price impact"
