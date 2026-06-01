@@ -1543,7 +1543,6 @@ dependencies = [
 name = "staking"
 version = "0.1.0"
 dependencies = [
- "amm",
  "soroban-sdk",
  "token",
 ]

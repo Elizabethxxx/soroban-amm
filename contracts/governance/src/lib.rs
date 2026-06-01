@@ -90,6 +90,8 @@ pub enum DataKey {
     Timelock,
     /// Quorum requirement in basis points of total LP supply at snapshot.
     QuorumBps,
+    /// Additional quorum bps required per day a proposal has been open (#311).
+    QuorumDecayRateBpsPerDay,
     /// Individual proposal storage.
     Proposal(u32),
     /// Vote record for a voter on a proposal: (proposal_id, voter).
@@ -163,6 +165,8 @@ pub struct GovernanceParams {
     pub quorum_bps: i128,
     pub min_proposer_stake_bps: i128,
     pub veto_multisig: Option<Address>,
+    /// Extra quorum bps per day open; 0 disables decay (#311).
+    pub quorum_decay_rate_bps_per_day: i128,
 }
 
 /// On-chain audit trail for a governance veto.
@@ -186,6 +190,7 @@ pub struct UpdateProtocolFeeParams {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProposalKind {
     UpdateFee(i128),
+    UpdateFeeTier(i128),  // 0-3: VeryLow, Low, Medium, High
     UpdateProtocolFee(UpdateProtocolFeeParams),
     UpdateFlashLoanFee(i128),
     TransferAdmin(Address),
@@ -303,8 +308,37 @@ impl Governance {
         env.storage()
             .instance()
             .set(&DataKey::MinProposerStakeBps, &min_proposer_stake_bps);
+        env.storage()
+            .instance()
+            .set(&DataKey::QuorumDecayRateBpsPerDay, &0i128);
         env.storage().instance().set(&DataKey::ProposalCount, &0u32);
         Ok(())
+    }
+
+    /// Admin-only: quorum increases by this many bps per day a proposal is open (#311).
+    pub fn set_quorum_decay_bps_per_day(
+        env: Env,
+        new_rate: i128,
+    ) -> Result<(), GovernanceError> {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        if new_rate < 0 {
+            return Err(GovernanceError::InvalidQuorumBps);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::QuorumDecayRateBpsPerDay, &new_rate);
+        Ok(())
+    }
+
+    /// Effective quorum bps for a proposal (base + decay, capped at 10_000).
+    pub fn get_effective_quorum(env: Env, proposal_id: u32) -> i128 {
+        let proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .expect("proposal not found");
+        Self::effective_quorum_bps(&env, &proposal)
     }
 
     /// Admin-only governance parameter update.
@@ -343,6 +377,10 @@ impl Governance {
                 if !(0..=MAX_BPS).contains(new_fee_bps) {
                     return Err(GovernanceError::InvalidFeeBps);
                 }
+            }
+            ProposalKind::UpdateFeeTier(fee_tier) => {
+                // Validate fee_tier is 0-3
+                Self::fee_tier_to_bps(*fee_tier)?;
             }
             ProposalKind::UpdateProtocolFee(params) => {
                 if !(0..=MAX_BPS).contains(&params.new_bps) {
@@ -551,9 +589,9 @@ impl Governance {
             return Err(GovernanceError::TimelockNotElapsed);
         }
 
-        let quorum_bps: i128 = env.storage().instance().get(&DataKey::QuorumBps).unwrap();
+        let effective_quorum = Self::effective_quorum_bps(&env, &proposal);
         let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
-        let quorum_threshold = proposal.snapshot_total_supply * quorum_bps / MAX_BPS;
+        let quorum_threshold = proposal.snapshot_total_supply * effective_quorum / MAX_BPS;
         if total_votes < quorum_threshold {
             return Err(GovernanceError::QuorumNotMet);
         }
@@ -567,6 +605,10 @@ impl Governance {
         match &proposal.kind {
             ProposalKind::UpdateFee(new_fee_bps) => {
                 amm_client.update_fee(new_fee_bps);
+            }
+            ProposalKind::UpdateFeeTier(fee_tier) => {
+                let new_fee_bps = Self::fee_tier_to_bps(*fee_tier)?;
+                amm_client.update_fee(&new_fee_bps);
             }
             ProposalKind::UpdateProtocolFee(params) => {
                 let self_addr = env.current_contract_address();
@@ -659,6 +701,11 @@ impl Governance {
                 .get(&DataKey::MinProposerStakeBps)
                 .unwrap(),
             veto_multisig: env.storage().instance().get(&DataKey::VetoMultisig),
+            quorum_decay_rate_bps_per_day: env
+                .storage()
+                .instance()
+                .get(&DataKey::QuorumDecayRateBpsPerDay)
+                .unwrap_or(0),
         }
     }
 
@@ -800,9 +847,9 @@ impl Governance {
             return Err(GovernanceError::VetoWindowExpired);
         }
 
-        let quorum_bps: i128 = env.storage().instance().get(&DataKey::QuorumBps).unwrap();
+        let effective_quorum = Self::effective_quorum_bps(&env, &proposal);
         let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
-        let quorum_threshold = proposal.snapshot_total_supply * quorum_bps / MAX_BPS;
+        let quorum_threshold = proposal.snapshot_total_supply * effective_quorum / MAX_BPS;
         if total_votes < quorum_threshold || proposal.votes_for <= proposal.votes_against {
             return Err(GovernanceError::ProposalDefeated);
         }
@@ -898,9 +945,9 @@ impl Governance {
             return ProposalStatus::Active;
         }
 
-        let quorum_bps: i128 = env.storage().instance().get(&DataKey::QuorumBps).unwrap();
+        let effective_quorum = Self::effective_quorum_bps(&env, &proposal);
         let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
-        let quorum_threshold = proposal.snapshot_total_supply * quorum_bps / MAX_BPS;
+        let quorum_threshold = proposal.snapshot_total_supply * effective_quorum / MAX_BPS;
         let passed = total_votes >= quorum_threshold && proposal.votes_for > proposal.votes_against;
 
         if !passed {
@@ -916,6 +963,25 @@ impl Governance {
         } else {
             ProposalStatus::Pending
         }
+    }
+
+    fn effective_quorum_bps(env: &Env, proposal: &Proposal) -> i128 {
+        let base: i128 = env.storage().instance().get(&DataKey::QuorumBps).unwrap();
+        let decay_rate: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::QuorumDecayRateBpsPerDay)
+            .unwrap_or(0);
+        if decay_rate == 0 {
+            return base;
+        }
+        let now = env.ledger().timestamp();
+        let days_open = if now > proposal.vote_start {
+            (now - proposal.vote_start) / 86_400
+        } else {
+            0
+        };
+        (base + decay_rate * days_open as i128).min(MAX_BPS)
     }
 
     fn snapshot_voting_power(
@@ -1054,6 +1120,23 @@ impl Governance {
         env.storage()
             .persistent()
             .extend_ttl(key, MIN_PERSISTENT_TTL, PERSISTENT_TTL_BUMP_TO);
+    }
+
+    /// Convert a fee tier ID (0-3) to its basis points value.
+    ///
+    /// Matches the fee tier definitions:
+    /// - 0 → 1 bps (0.01%)
+    /// - 1 → 5 bps (0.05%)
+    /// - 2 → 30 bps (0.3%)
+    /// - 3 → 100 bps (1.0%)
+    fn fee_tier_to_bps(fee_tier: i128) -> Result<i128, GovernanceError> {
+        match fee_tier {
+            0 => Ok(1),      // VeryLow: 0.01%
+            1 => Ok(5),      // Low: 0.05%
+            2 => Ok(30),     // Medium: 0.3%
+            3 => Ok(100),    // High: 1.0%
+            _ => Err(GovernanceError::InvalidFeeBps),
+        }
     }
 }
 
@@ -2463,5 +2546,71 @@ mod prop_tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn test_quorum_decay_passes_before_decay() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        gov.set_quorum_decay_bps_per_day(&100_i128);
+
+        let lp1 = Address::generate(&s.env);
+        let lp2 = Address::generate(&s.env);
+        mint_lp(&s, &lp1, 600);
+        mint_lp(&s, &lp2, 400);
+
+        let pid = gov.propose(&lp1, &ProposalKind::UpdateFee(50));
+        gov.vote(&lp1, &pid, &Vote::For);
+        gov.vote(&lp2, &pid, &Vote::For);
+
+        let proposal = gov.get_proposal(&pid);
+        s.env.ledger().set_timestamp(proposal.execute_after + 1);
+        assert_eq!(gov.get_effective_quorum(&pid), 1_000);
+        gov.execute(&pid);
+        assert_eq!(gov.proposal_status(&pid), ProposalStatus::Executed);
+    }
+
+    #[test]
+    fn test_quorum_decay_defeats_after_threshold() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        gov.set_quorum_decay_bps_per_day(&500_i128);
+
+        let lp1 = Address::generate(&s.env);
+        let lp2 = Address::generate(&s.env);
+        mint_lp(&s, &lp1, 600);
+        mint_lp(&s, &lp2, 400);
+
+        let pid = gov.propose(&lp1, &ProposalKind::UpdateFee(50));
+        // 60 % of supply voted — below 100 % effective quorum after decay.
+        gov.vote(&lp1, &pid, &Vote::For);
+
+        let proposal = gov.get_proposal(&pid);
+        // 20 days * 500 bps/day + 1000 base = 11000 capped at 10000
+        s.env
+            .ledger()
+            .set_timestamp(proposal.vote_start + 20 * 86_400);
+        s.env.ledger().set_timestamp(proposal.execute_after + 1);
+
+        assert_eq!(gov.get_effective_quorum(&pid), 10_000);
+        assert_eq!(gov.proposal_status(&pid), ProposalStatus::Defeated);
+    }
+
+    #[test]
+    fn test_quorum_decay_disabled_when_rate_zero() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+        let lp1 = Address::generate(&s.env);
+        mint_lp(&s, &lp1, 1_000);
+
+        let pid = gov.propose(&lp1, &ProposalKind::UpdateFee(50));
+        gov.vote(&lp1, &pid, &Vote::For);
+
+        let proposal = gov.get_proposal(&pid);
+        s.env
+            .ledger()
+            .set_timestamp(proposal.vote_start + 100 * 86_400);
+        assert_eq!(gov.get_effective_quorum(&pid), 1_000);
     }
 }
