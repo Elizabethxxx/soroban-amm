@@ -7,6 +7,9 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -46,8 +49,4 @@ jobs:
         uses: rustsec/audit-check@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-        # Advisories can be ignored via audit.toml at the repo root.
-        # Example:
-        #   [[ignore]]
-        #   id = "RUSTSEC-0000-0000"
-        #   reason = "Not exploitable in this context because ..."
+        # Advisories can be ignored via .cargo/audit.toml.
