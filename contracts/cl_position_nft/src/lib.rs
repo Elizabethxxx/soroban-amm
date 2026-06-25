@@ -3,11 +3,14 @@
 //! Each token represents an open CL position (`pool`, `lower_tick`, `upper_tick`).
 //! Only the registered `cl_pool` address may mint or burn tokens; the pool calls
 //! `mint` when a position opens and `burn` when it fully closes.
+//!
+//! Global state (admin, pool, id counter) lives in instance storage. Per-token
+//! and per-owner state lives in persistent storage, matching the layout
+//! established on `main`.
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractclient, contractimpl, contracterror, contracttype, symbol_short, Address,
-    Env, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Vec,
 };
 
 // ── WASM bytes for test harness ──────────────────────────────────────────────
@@ -18,36 +21,42 @@ pub const WASM: &[u8] = include_bytes!(concat!(
 ));
 
 // ── Errors ───────────────────────────────────────────────────────────────────
-
 #[contracterror]
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum NftError {
     AlreadyInitialized = 1,
     Unauthorized       = 2,
     TokenNotFound      = 3,
+    // Reserved for the upcoming transfer / operator-approval work.
+    NotOwnerOrApproved = 4,
+    InvalidReceiver    = 5,
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
-
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub enum DataKey {
-    /// Address of the registered cl_pool contract (set once during `initialize`).
+    /// Admin address, set once during `initialize`. Instance storage.
+    Admin,
+    /// Registered cl_pool contract, set once during `initialize`. Instance storage.
     ClPool,
-    /// Monotonically-increasing counter; next token id to assign.
+    /// Monotonically-increasing counter; next token id to assign. Instance storage.
     NextTokenId,
-    /// Owner of a specific token: `Owner(token_id) → Address`.
+    /// Owner of a token: `Owner(token_id) → Address`. Persistent.
     Owner(u64),
-    /// Optional approved address for a token: `Approved(token_id) → Address`.
+    /// Approved address for a single token: `Approved(token_id) → Address`. Persistent.
     Approved(u64),
-    /// Position metadata for a token: `TokenPosition(token_id) → PositionMeta`.
+    /// Operator approval over all of an owner's tokens:
+    /// `OperatorApproval(owner, operator) → bool`. Persistent.
+    /// Reserved for the upcoming transfer/operator work.
+    OperatorApproval(Address, Address),
+    /// Position metadata: `TokenPosition(token_id) → PositionMeta`. Persistent.
     TokenPosition(u64),
-    /// All token ids owned by an address: `OwnedTokens(owner) → Vec<u64>`.
+    /// All token ids owned by an address: `OwnedTokens(owner) → Vec<u64>`. Persistent.
     OwnedTokens(Address),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
-
 /// Metadata attached to each NFT at mint-time.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -61,51 +70,22 @@ pub struct PositionMeta {
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
-
 #[contract]
 pub struct ClPositionNft;
-
-#[contractclient(name = "ClPositionNftClient")]
-pub trait ClPositionNftInterface {
-    fn initialize(env: Env, cl_pool: Address) -> Result<(), NftError>;
-
-    fn mint(
-        env: Env,
-        to: Address,
-        pool: Address,
-        lower_tick: i32,
-        upper_tick: i32,
-    ) -> Result<u64, NftError>;
-
-    fn burn(env: Env, token_id: u64) -> Result<(), NftError>;
-
-    fn owner_of(env: Env, token_id: u64) -> Result<Address, NftError>;
-
-    fn get_position(env: Env, token_id: u64) -> Result<PositionMeta, NftError>;
-
-    fn tokens_of(env: Env, owner: Address) -> Vec<u64>;
-
-    fn approve(env: Env, caller: Address, token_id: u64, approved: Address) -> Result<(), NftError>;
-
-    fn get_approved(env: Env, token_id: u64) -> Option<Address>;
-
-    fn cl_pool(env: Env) -> Address;
-}
 
 #[contractimpl]
 impl ClPositionNft {
     // ── One-time setup ────────────────────────────────────────────────────────
 
-    /// Registers the CL pool address that is permitted to mint/burn tokens.
+    /// Registers the admin and the CL pool address permitted to mint/burn.
     /// May only be called once.
-    pub fn initialize(env: Env, cl_pool: Address) -> Result<(), NftError> {
-        if env.storage().instance().has(&DataKey::ClPool) {
+    pub fn initialize(env: Env, admin: Address, cl_pool: Address) -> Result<(), NftError> {
+        if env.storage().instance().has(&DataKey::Admin) {
             return Err(NftError::AlreadyInitialized);
         }
+        env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::ClPool, &cl_pool);
-        env.storage()
-            .instance()
-            .set(&DataKey::NextTokenId, &0_u64);
+        env.storage().instance().set(&DataKey::NextTokenId, &0_u64);
         Ok(())
     }
 
@@ -123,12 +103,10 @@ impl ClPositionNft {
 
     // ── Core lifecycle ────────────────────────────────────────────────────────
 
-    /// Mint a new position NFT.
+    /// Mint a new position NFT. Callable **only** by the registered `cl_pool`.
     ///
-    /// Callable **only** by the registered `cl_pool` address.
-    /// Increments `NextTokenId`, stores owner and position metadata, appends
-    /// the token id to `OwnedTokens(to)`, and emits a `mint` event.
-    ///
+    /// Increments `NextTokenId`, stores owner + position metadata, appends the
+    /// token id to `OwnedTokens(to)`, and emits a `nft_mint` event.
     /// Returns the newly-assigned token id (sequential, starting at 0).
     pub fn mint(
         env: Env,
@@ -149,77 +127,75 @@ impl ClPositionNft {
             .instance()
             .set(&DataKey::NextTokenId, &(token_id + 1));
 
-        // Store owner.
+        // Store owner (persistent).
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::Owner(token_id), &to);
 
-        // Store position metadata.
+        // Store position metadata (persistent).
         let meta = PositionMeta {
             pool,
             lower_tick,
             upper_tick,
         };
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::TokenPosition(token_id), &meta);
 
-        // Append to the owner's token list.
+        // Append to the owner's token list (persistent).
         let list_key = DataKey::OwnedTokens(to.clone());
         let mut owned: Vec<u64> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&list_key)
             .unwrap_or_else(|| Vec::new(&env));
         owned.push_back(token_id);
-        env.storage().instance().set(&list_key, &owned);
+        env.storage().persistent().set(&list_key, &owned);
 
-        // Emit mint event: topic=(mint, to), data=token_id.
+        // Emit mint event: topic=(nft_mint, to), data=token_id.
         env.events()
             .publish((symbol_short!("nft_mint"), to), token_id);
 
         Ok(token_id)
     }
 
-    /// Burn an existing position NFT.
+    /// Burn an existing position NFT. Callable **only** by the registered `cl_pool`.
     ///
-    /// Callable **only** by the registered `cl_pool` address.
-    /// Removes `Owner`, `Approved`, and `TokenPosition` entries and prunes the
-    /// token id from `OwnedTokens(owner)`. Emits a `burn` event.
-    ///
+    /// Removes `Owner`, `Approved`, and `TokenPosition`, prunes the id from
+    /// `OwnedTokens(owner)`, and emits a `nft_burn` event.
     /// Returns [`NftError::TokenNotFound`] if the token does not exist.
     pub fn burn(env: Env, token_id: u64) -> Result<(), NftError> {
         Self::require_pool(&env)?;
 
-        // Resolve the current owner – error if token doesn't exist.
+        // Resolve the current owner – error if the token doesn't exist.
         let owner: Address = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Owner(token_id))
             .ok_or(NftError::TokenNotFound)?;
 
         // Remove core token state.
-        env.storage().instance().remove(&DataKey::Owner(token_id));
+        env.storage().persistent().remove(&DataKey::Owner(token_id));
         env.storage()
-            .instance()
+            .persistent()
             .remove(&DataKey::Approved(token_id));
         env.storage()
-            .instance()
+            .persistent()
             .remove(&DataKey::TokenPosition(token_id));
 
         // Remove from the owner's token list.
         let list_key = DataKey::OwnedTokens(owner.clone());
         let mut owned: Vec<u64> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&list_key)
             .unwrap_or_else(|| Vec::new(&env));
         if let Some(idx) = owned.iter().position(|id| id == token_id) {
             owned.remove(idx as u32);
-            env.storage().instance().set(&list_key, &owned);
+            env.storage().persistent().set(&list_key, &owned);
         }
 
-        // Emit burn event: topic=(burn, owner), data=token_id.
+        // Emit burn event: topic=(nft_burn, owner), data=token_id.
         env.events()
             .publish((symbol_short!("nft_burn"), owner), token_id);
 
@@ -231,7 +207,7 @@ impl ClPositionNft {
     /// Returns the owner of `token_id`, or [`NftError::TokenNotFound`].
     pub fn owner_of(env: Env, token_id: u64) -> Result<Address, NftError> {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Owner(token_id))
             .ok_or(NftError::TokenNotFound)
     }
@@ -239,7 +215,7 @@ impl ClPositionNft {
     /// Returns the [`PositionMeta`] for `token_id`, or [`NftError::TokenNotFound`].
     pub fn get_position(env: Env, token_id: u64) -> Result<PositionMeta, NftError> {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::TokenPosition(token_id))
             .ok_or(NftError::TokenNotFound)
     }
@@ -247,12 +223,12 @@ impl ClPositionNft {
     /// Returns all token ids owned by `owner` (empty vec if none).
     pub fn tokens_of(env: Env, owner: Address) -> Vec<u64> {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::OwnedTokens(owner))
             .unwrap_or_else(|| Vec::new(&env))
     }
 
-    /// Approve `approved` to transfer `token_id`. Only callable by the current owner.
+    /// Approve `approved` to transfer `token_id`. Only callable by the owner.
     pub fn approve(
         env: Env,
         caller: Address,
@@ -261,7 +237,7 @@ impl ClPositionNft {
     ) -> Result<(), NftError> {
         let owner: Address = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Owner(token_id))
             .ok_or(NftError::TokenNotFound)?;
         if caller != owner {
@@ -269,45 +245,81 @@ impl ClPositionNft {
         }
         caller.require_auth();
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::Approved(token_id), &approved);
         Ok(())
     }
 
     /// Returns the currently-approved address for `token_id`, if any.
     pub fn get_approved(env: Env, token_id: u64) -> Option<Address> {
-        env.storage().instance().get(&DataKey::Approved(token_id))
+        env.storage().persistent().get(&DataKey::Approved(token_id))
+    }
+
+    /// Returns the registered admin address.
+    pub fn admin(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::Admin).unwrap()
     }
 
     /// Returns the registered `cl_pool` address.
     pub fn cl_pool(env: Env) -> Address {
         env.storage().instance().get(&DataKey::ClPool).unwrap()
     }
+
+    /// Returns the next token id that will be assigned.
+    pub fn next_token_id(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::NextTokenId)
+            .unwrap_or(0)
+    }
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use soroban_sdk::{testutils::Address as _, Env};
 
-    fn setup() -> (Env, ClPositionNftClient<'static>, Address, Address) {
+    /// Returns (env, client, admin, pool, user) with the contract initialized
+    /// and all auths mocked.
+    fn setup() -> (Env, ClPositionNftClient<'static>, Address, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(ClPositionNft, ());
         let client = ClPositionNftClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
         let pool = Address::generate(&env);
         let user = Address::generate(&env);
-        client.initialize(&pool);
-        (env, client, pool, user)
+        client.initialize(&admin, &pool);
+        (env, client, admin, pool, user)
+    }
+
+    // ── initialize ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn initialize_stores_global_state() {
+        let (_, client, admin, pool, _) = setup();
+        assert_eq!(client.admin(), admin);
+        assert_eq!(client.cl_pool(), pool);
+        assert_eq!(client.next_token_id(), 0);
+    }
+
+    #[test]
+    fn initialize_twice_returns_already_initialized() {
+        let (env, client, _admin, pool, _) = setup();
+        let other_admin = Address::generate(&env);
+        let err = client
+            .try_initialize(&other_admin, &pool)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, NftError::AlreadyInitialized);
     }
 
     // ── mint ─────────────────────────────────────────────────────────────────
 
     #[test]
     fn mint_assigns_sequential_ids_starting_at_zero() {
-        let (env, client, pool, user) = setup();
+        let (env, client, _admin, pool, user) = setup();
 
         let id0 = client.mint(&user, &pool, &-100, &100);
         let id1 = client.mint(&user, &pool, &-200, &200);
@@ -315,30 +327,25 @@ mod tests {
         assert_eq!(id0, 0);
         assert_eq!(id1, 1);
 
-        // Owner is correctly stored.
         assert_eq!(client.owner_of(&id0), user);
         assert_eq!(client.owner_of(&id1), user);
 
-        // Position metadata is stored.
         let meta0 = client.get_position(&id0);
         assert_eq!(meta0.lower_tick, -100);
         assert_eq!(meta0.upper_tick, 100);
 
-        // OwnedTokens list is updated.
         let owned = client.tokens_of(&user);
         assert_eq!(owned.len(), 2);
         assert_eq!(owned.get(0), Some(0_u64));
         assert_eq!(owned.get(1), Some(1_u64));
 
-        // Verify event was emitted (no panic = success; Soroban test harness
-        // captures events but doesn't expose typed assertions without a full
-        // snapshot test setup – the publish call itself is the assertion).
+        // Events are published; the harness captures them.
         let _ = env.events().all();
     }
 
     #[test]
     fn mint_stores_correct_position_meta() {
-        let (_, client, pool, user) = setup();
+        let (_, client, _admin, pool, user) = setup();
         let id = client.mint(&user, &pool, &-500, &500);
         let meta = client.get_position(&id);
         assert_eq!(meta.pool, pool);
@@ -350,37 +357,25 @@ mod tests {
 
     #[test]
     fn burn_clears_all_state() {
-        let (_, client, pool, user) = setup();
+        let (env, client, _admin, pool, user) = setup();
 
         // Mint then set an approval to verify it is also cleared.
         let id = client.mint(&user, &pool, &-100, &100);
-        let approver = user.clone();
         let approved_addr = Address::generate(&env);
-        client.approve(&approver, &id, &approved_addr);
+        client.approve(&user, &id, &approved_addr);
         assert_eq!(client.get_approved(&id), Some(approved_addr));
 
-        // Burn.
         client.burn(&id);
 
-        // Owner removed.
-        let result = client.try_owner_of(&id);
-        assert!(result.is_err());
-
-        // Position metadata removed.
-        let result = client.try_get_position(&id);
-        assert!(result.is_err());
-
-        // Approval cleared.
+        assert!(client.try_owner_of(&id).is_err());
+        assert!(client.try_get_position(&id).is_err());
         assert_eq!(client.get_approved(&id), None);
-
-        // Removed from OwnedTokens.
-        let owned = client.tokens_of(&user);
-        assert_eq!(owned.len(), 0);
+        assert_eq!(client.tokens_of(&user).len(), 0);
     }
 
     #[test]
     fn double_burn_returns_token_not_found() {
-        let (_, client, pool, user) = setup();
+        let (_, client, _admin, pool, user) = setup();
         let id = client.mint(&user, &pool, &-100, &100);
         client.burn(&id);
         let err = client.try_burn(&id).unwrap_err().unwrap();
@@ -389,7 +384,7 @@ mod tests {
 
     #[test]
     fn burn_non_existent_token_returns_token_not_found() {
-        let (_, client, _, _) = setup();
+        let (_, client, _admin, _pool, _) = setup();
         let err = client.try_burn(&999_u64).unwrap_err().unwrap();
         assert_eq!(err, NftError::TokenNotFound);
     }
@@ -397,65 +392,61 @@ mod tests {
     // ── authorization ────────────────────────────────────────────────────────
 
     #[test]
-    fn mint_by_unauthorized_caller_is_rejected() {
-        let env = Env::default();
-        // Do NOT call mock_all_auths – auth is real.
-        let contract_id = env.register(ClPositionNft, ());
-        let client = ClPositionNftClient::new(&env, &contract_id);
-
-        let pool = Address::generate(&env);
-        let attacker = Address::generate(&env);
-
-        // Initialize with the real pool address.
-        env.mock_all_auths();
-        client.initialize(&pool);
-
-        // Reset to strict auth – the attacker address has no auth.
-        // Calling mint without the pool's auth should panic / return auth error.
-        // We wrap in try_ and verify it errors.
-        let result = client.try_mint(&attacker, &pool, &-100, &100);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn burn_by_unauthorized_caller_is_rejected() {
+    #[should_panic]
+    fn mint_requires_pool_auth() {
         let env = Env::default();
         let contract_id = env.register(ClPositionNft, ());
         let client = ClPositionNftClient::new(&env, &contract_id);
-
+        let admin = Address::generate(&env);
         let pool = Address::generate(&env);
         let user = Address::generate(&env);
 
-        // Initialize + mint with mocked auth.
         env.mock_all_auths();
-        client.initialize(&pool);
+        client.initialize(&admin, &pool);
+
+        // No auths for the next call: pool.require_auth() must fail.
+        env.set_auths(&[]);
+        client.mint(&user, &pool, &-100, &100);
+    }
+
+    #[test]
+    #[should_panic]
+    fn burn_requires_pool_auth() {
+        let env = Env::default();
+        let contract_id = env.register(ClPositionNft, ());
+        let client = ClPositionNftClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let pool = Address::generate(&env);
+        let user = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.initialize(&admin, &pool);
         let id = client.mint(&user, &pool, &-100, &100);
 
-        // Without pool auth the burn must fail.
-        let result = client.try_burn(&id);
-        assert!(result.is_err());
+        // Strip auth, then burn: pool.require_auth() must fail.
+        env.set_auths(&[]);
+        client.burn(&id);
     }
 
     // ── view helpers ─────────────────────────────────────────────────────────
 
     #[test]
     fn owner_of_non_existent_token_returns_not_found() {
-        let (_, client, _, _) = setup();
+        let (_, client, _admin, _pool, _) = setup();
         let err = client.try_owner_of(&42_u64).unwrap_err().unwrap();
         assert_eq!(err, NftError::TokenNotFound);
     }
 
     #[test]
     fn tokens_of_empty_returns_empty_vec() {
-        let (env, client, _, _) = setup();
+        let (env, client, _admin, _pool, _) = setup();
         let nobody = Address::generate(&env);
-        let owned = client.tokens_of(&nobody);
-        assert_eq!(owned.len(), 0);
+        assert_eq!(client.tokens_of(&nobody).len(), 0);
     }
 
     #[test]
     fn multiple_users_have_independent_token_lists() {
-        let (env, client, pool, user_a) = setup();
+        let (env, client, _admin, pool, user_a) = setup();
         let user_b = Address::generate(&env);
 
         let id0 = client.mint(&user_a, &pool, &-100, &100);
@@ -471,18 +462,5 @@ mod tests {
 
         assert_eq!(b_owned.len(), 1);
         assert!(b_owned.iter().any(|id| id == id1));
-    }
-
-    #[test]
-    fn cl_pool_returns_registered_pool() {
-        let (_, client, pool, _) = setup();
-        assert_eq!(client.cl_pool(), pool);
-    }
-
-    #[test]
-    fn initialize_twice_returns_already_initialized() {
-        let (_, client, pool, _) = setup();
-        let err = client.try_initialize(&pool).unwrap_err().unwrap();
-        assert_eq!(err, NftError::AlreadyInitialized);
     }
 }
